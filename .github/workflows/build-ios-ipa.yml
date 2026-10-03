@@ -1,0 +1,191 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build signed iPhone IPA
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.5
+          channel: stable
+          cache: true
+
+      - name: Import Apple development signing assets
+        env:
+          IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for name in IOS_CERTIFICATE_BASE64 IOS_CERTIFICATE_PASSWORD IOS_PROVISIONING_PROFILE_BASE64 IOS_BUNDLE_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required GitHub secret or variable: ${name}"
+              exit 1
+            fi
+          done
+
+          if [[ "$IOS_BUNDLE_ID" == com.example.* ]]; then
+            echo "::error::Set IOS_BUNDLE_ID to an App ID registered to your Apple Developer account."
+            exit 1
+          fi
+
+          keychain="$RUNNER_TEMP/ios-build.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          certificate_path="$RUNNER_TEMP/ios-signing-certificate.p12"
+          profile_path="$RUNNER_TEMP/ios-development.mobileprovision"
+          profile_plist="$RUNNER_TEMP/ios-development-profile.plist"
+
+          printf '%s' "$IOS_CERTIFICATE_BASE64" | base64 --decode > "$certificate_path"
+          printf '%s' "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$profile_path"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate_path" \
+            -P "$IOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -s "$keychain"
+
+          security cms -D -i "$profile_path" > "$profile_plist"
+          profile_uuid=$(/usr/libexec/PlistBuddy -c 'Print UUID' "$profile_plist")
+          profile_name=$(/usr/libexec/PlistBuddy -c 'Print Name' "$profile_plist")
+          team_id=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$profile_plist")
+          application_id=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$profile_plist")
+
+          if [[ "$application_id" != *".$IOS_BUNDLE_ID" ]]; then
+            echo "::error::The provisioning profile does not match IOS_BUNDLE_ID."
+            exit 1
+          fi
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$profile_path" "$HOME/Library/MobileDevice/Provisioning Profiles/$profile_uuid.mobileprovision"
+
+          {
+            echo "IOS_TEAM_ID=$team_id"
+            echo "IOS_PROFILE_UUID=$profile_uuid"
+            echo "IOS_PROFILE_NAME=$profile_name"
+            echo "IOS_KEYCHAIN=$keychain"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure Xcode signing
+        env:
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          project = Path("ios/Runner.xcodeproj/project.pbxproj")
+          contents = project.read_text()
+          contents = contents.replace(
+              '"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "iPhone Developer";',
+              '"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Development";',
+          )
+          configurations = {
+              "97C147061CF9000F007C117D": "Debug",
+              "97C147071CF9000F007C117D": "Release",
+              "249021D4217E4FDB00AE95B9": "Profile",
+          }
+          signing = (
+              f'DEVELOPMENT_TEAM = {os.environ["IOS_TEAM_ID"]};\n'
+              'CODE_SIGN_STYLE = Manual;\n'
+              'CODE_SIGN_IDENTITY = "Apple Development";\n'
+              '"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Development";\n'
+              f'PROVISIONING_PROFILE = {os.environ["IOS_PROFILE_UUID"]};\n'
+              f'PROVISIONING_PROFILE_SPECIFIER = {os.environ["IOS_PROFILE_UUID"]};\n'
+          )
+
+          for identifier, configuration in configurations.items():
+              marker = f"{identifier} /* {configuration} */ = {{"
+              start = contents.index(marker)
+              end = contents.index("\n\t\t};", start) + len("\n\t\t};")
+              block = contents[start:end]
+              settings_marker = "\t\t\tbuildSettings = {\n"
+              if settings_marker not in block:
+                  raise RuntimeError(f"Missing build settings for {configuration}")
+              block = block.replace(
+                  settings_marker,
+                  settings_marker + signing,
+                  1,
+              )
+              block, replacements = re.subn(
+                  r"PRODUCT_BUNDLE_IDENTIFIER = [^;]+;",
+                  f'PRODUCT_BUNDLE_IDENTIFIER = {os.environ["IOS_BUNDLE_ID"]};',
+                  block,
+                  count=1,
+              )
+              if replacements != 1:
+                  raise RuntimeError(f"Missing bundle identifier for {configuration}")
+              contents = contents[:start] + block + contents[end:]
+
+          project.write_text(contents)
+          PY
+
+      - name: Create development export options
+        env:
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import plistlib
+          from pathlib import Path
+
+          export_options = {
+              "method": "development",
+              "signingStyle": "manual",
+              "signingCertificate": "Apple Development",
+              "teamID": os.environ["IOS_TEAM_ID"],
+              "provisioningProfiles": {
+                  os.environ["IOS_BUNDLE_ID"]: os.environ["IOS_PROFILE_UUID"]
+              },
+          }
+          path = Path(os.environ["RUNNER_TEMP"]) / "ExportOptions.plist"
+          path.write_bytes(plistlib.dumps(export_options))
+          PY
+
+      - name: Build signed IPA
+        run: |
+          flutter pub get
+          flutter build ipa --export-options-plist="$RUNNER_TEMP/ExportOptions.plist"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-freedom-ios-ipa
+          path: build/ios/ipa/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Clean up signing material
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${IOS_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$IOS_KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/ios-signing-certificate.p12"
+          rm -f "$RUNNER_TEMP/ios-development.mobileprovision"
+          rm -f "$RUNNER_TEMP/ios-development-profile.plist"
+          rm -f "$RUNNER_TEMP/ExportOptions.plist"
